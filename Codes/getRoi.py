@@ -16,8 +16,7 @@ from ultralytics import YOLO
 
 VIDEO_FILENAME = "100vs100_HMN1_MT15_TN23_CR15-12.MP4"
 MODEL_ONE_NAME = "Model_One_fp16.pt"
-CROP_SIZE = 1280  # square 640x640
-
+CROP_SIZE = 1280  
 
 # =========================
 # Path & environment helpers
