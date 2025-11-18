@@ -19,6 +19,7 @@ VIDEO_FILENAME = "100vs100_HMN1_MT15_TN23_CR15-12.MP4"
 MODEL_ONE_NAME = "Model_One_fp16.pt"
 MODEL_SCOREBOARD = "Model_Scoreboard_fp16.pt"
 MODEL_POINT_DETECTOR = "Model_PointDetector21_fp16.pt"
+MODEL_TWO_NAME = "Model_Two_fp16.pt"   # <--- NEW: pose / skeleton model
 
 OUTPUT_VIDEO_NAME = "annotated_combined.mp4"
 
@@ -28,12 +29,41 @@ TRACKER_CONFIG = "bytetrack.yaml"
 # Batch size for batched frame processing
 BATCH_SIZE = 32
 
+# Custom skeleton edges (using your indices)
+skeleton_edges = [
+    # top triangle
+    (0, 1),  # mask-as
+    (0, 7),  # mask-nas
+    (1, 7),  # as-nas
+
+    # central body square
+    (1, 4),   # as-aa
+    (4, 10),  # aa-naa
+    (10, 7),  # naa-nas
+
+    # armed arm
+    (1, 2),  # as-ae
+    (2, 3),  # ae-ah
+
+    # not armed arm
+    (7, 8),
+    (8, 9),
+
+    # armed leg
+    (4, 5),
+    (5, 6),
+
+    # not armed leg
+    (10, 11),
+    (11, 12),
+]
+
 
 # =========================
 # Path & environment helpers
 # =========================
 
-def get_project_paths() -> Tuple[Path, Path, Path, Path, Path, Path]:
+def get_project_paths() -> Tuple[Path, Path, Path, Path, Path, Path, Path]:
     """
     Returns:
         base_dir:             project root (one level above Codes/)
@@ -41,6 +71,7 @@ def get_project_paths() -> Tuple[Path, Path, Path, Path, Path, Path]:
         model_one_path:       full path to Model_One_fp16.pt
         model_pointdetector_path: full path to Model_PointDetector21_fp16.pt
         model_scoreboard_path: full path to Model_Scoreboard_fp16.pt
+        model_two_path:       full path to Model_Two_fp16.pt
         output_dir:           Output folder path
     """
     base_dir = Path(__file__).resolve().parents[1]
@@ -52,8 +83,17 @@ def get_project_paths() -> Tuple[Path, Path, Path, Path, Path, Path]:
     model_one_path = models_dir / MODEL_ONE_NAME
     model_pointdetector_path = models_dir / MODEL_POINT_DETECTOR
     model_scoreboard_path = models_dir / MODEL_SCOREBOARD
+    model_two_path = models_dir / MODEL_TWO_NAME
 
-    return base_dir, input_video, model_one_path, model_pointdetector_path, model_scoreboard_path, output_dir
+    return (
+        base_dir,
+        input_video,
+        model_one_path,
+        model_pointdetector_path,
+        model_scoreboard_path,
+        model_two_path,
+        output_dir,
+    )
 
 
 def check_file_exists(path: Path, description: str) -> None:
@@ -246,6 +286,50 @@ def draw_detections_on_frame_with_offset(
         )
 
 
+def draw_skeleton_on_frame(
+    frame,
+    keypoints_xy,
+    keypoints_conf=None,
+    edges=None,
+    color=(0, 255, 255),
+    conf_th: float = 0.3,
+):
+    """
+    Draws a custom skeleton on the frame given keypoints and edges.
+
+    keypoints_xy:  (num_kpts, 2) array-like with (x, y) in image coords
+    keypoints_conf: (num_kpts,) confidences or None
+    edges: list of (i, j) pairs
+    """
+    if edges is None:
+        return
+    if keypoints_xy is None:
+        return
+
+    num_kpts = len(keypoints_xy)
+    if num_kpts == 0:
+        return
+
+    for (i, j) in edges:
+        if i >= num_kpts or j >= num_kpts:
+            continue
+
+        x_i, y_i = keypoints_xy[i]
+        x_j, y_j = keypoints_xy[j]
+
+        if keypoints_conf is not None:
+            if i < len(keypoints_conf) and j < len(keypoints_conf):
+                if keypoints_conf[i] < conf_th or keypoints_conf[j] < conf_th:
+                    continue
+
+        p1 = (int(x_i), int(y_i))
+        p2 = (int(x_j), int(y_j))
+
+        cv2.line(frame, p1, p2, color, 2)
+        cv2.circle(frame, p1, 3, color, -1)
+        cv2.circle(frame, p2, 3, color, -1)
+
+
 # =========================
 # Scoreboard detection (first frame)
 # =========================
@@ -291,6 +375,7 @@ def process_video_with_models(
     model_one: YOLO,
     model_scoreboard: YOLO,
     model_pointdetector: YOLO,
+    model_two: YOLO,
     output_video_path: Path,
     device: str,
     batch_size: int,
@@ -299,21 +384,31 @@ def process_video_with_models(
     Batched processing + ByteTrack tracking for fencers (model_one).
 
     - model_one: uses .track(...) with tracker="bytetrack.yaml" and persist=True
-                 on batched frames (list of np.ndarray).
+                 on batched frames (list of np.ndarray) to track all fencers.
+      * We specially track ID1 and ID2 for skeleton.
     - model_scoreboard: used on first frame only to find scoreboard bbox.
     - model_pointdetector: runs on cropped scoreboard area (batched crops).
-    - CSV: one row per frame with:
+    - model_two: pose/skeleton model, runs ONLY on expanded crops
+                 of fencer ID1 and ID2.
+
+    CSV: one row per frame with:
         Frame_Number, Time, TouchLeft, TouchRight,
-        Box_FencerID1, Box_FencerID2
+        Box_FencerID1, Box_FencerID2,
+        SkeletonID1, SkeletonID2
 
     Box_FencerID1 / Box_FencerID2:
       - bbox of track ID 1/2 in the format "x1,y1,x2,y2"
       - "NaN" if that ID is not detected in that frame.
 
+    SkeletonID1 / SkeletonID2:
+      - skeleton keypoints in the format "x0,y0;x1,y1;...;x12,y12"
+      - "NaN" if skeleton not detected for that ID in that frame.
+
     Thresholds:
       - model_one (tracking, fencers): conf = 0.8
       - model_scoreboard: conf = 0.5
       - model_pointdetector: conf = 0.5 and p >= 0.5 in Python filter
+      - model_two (pose): conf = 0.5 for detections, keypoints conf >= 0.3 for drawing
     """
     cap = open_video_capture(video_path)
     fps, width, height, total_frames = get_video_properties(cap)
@@ -372,6 +467,8 @@ def process_video_with_models(
             "TouchRight",
             "Box_FencerID1",
             "Box_FencerID2",
+            "SkeletonID1",
+            "SkeletonID2",
         ])
 
         try:
@@ -388,6 +485,11 @@ def process_video_with_models(
                     batch_touch_right = [0] * n_batch
                     batch_box_fencerID1 = ["NaN"] * n_batch
                     batch_box_fencerID2 = ["NaN"] * n_batch
+                    batch_box_coords_id1: List[Optional[Tuple[int, int, int, int]]] = [None] * n_batch
+                    batch_box_coords_id2: List[Optional[Tuple[int, int, int, int]]] = [None] * n_batch
+
+                    batch_skeleton_id1 = ["NaN"] * n_batch
+                    batch_skeleton_id2 = ["NaN"] * n_batch
 
                     # --- 2) model_one + ByteTrack on full frames (batched) ---
                     results_one = model_one.track(
@@ -433,14 +535,18 @@ def process_video_with_models(
                                 conf = boxes.conf.cpu().numpy()
                                 tids = boxes.id.cpu().numpy().astype(int)
 
-                                # helper for ID 1 and ID 2
-                                for target_id, store_array in ((1, batch_box_fencerID1), (2, batch_box_fencerID2)):
-                                    idxs = [j for j, tid in enumerate(tids) if tid == target_id]
-                                    if idxs:
-                                        # pick the one with highest confidence for that ID
-                                        best_j = max(idxs, key=lambda j: conf[j])
+                                for target_id in (1, 2):
+                                    idxs_id = [j for j, tid in enumerate(tids) if tid == target_id]
+                                    if idxs_id:
+                                        best_j = max(idxs_id, key=lambda j: conf[j])
                                         x1_, y1_, x2_, y2_ = xyxy[best_j]
-                                        store_array[idx] = f"{int(x1_)},{int(y1_)},{int(x2_)},{int(y2_)}"
+                                        x1_i, y1_i, x2_i, y2_i = int(x1_), int(y1_), int(x2_), int(y2_)
+                                        if target_id == 1:
+                                            batch_box_fencerID1[idx] = f"{x1_i},{y1_i},{x2_i},{y2_i}"
+                                            batch_box_coords_id1[idx] = (x1_i, y1_i, x2_i, y2_i)
+                                        else:
+                                            batch_box_fencerID2[idx] = f"{x1_i},{y1_i},{x2_i},{y2_i}"
+                                            batch_box_coords_id2[idx] = (x1_i, y1_i, x2_i, y2_i)
                     else:
                         for idx, (frame, r1) in enumerate(zip(frames, results_one)):
                             draw_detections_on_frame(
@@ -458,12 +564,18 @@ def process_video_with_models(
                                 conf = boxes.conf.cpu().numpy()
                                 tids = boxes.id.cpu().numpy().astype(int)
 
-                                for target_id, store_array in ((1, batch_box_fencerID1), (2, batch_box_fencerID2)):
-                                    idxs = [j for j, tid in enumerate(tids) if tid == target_id]
-                                    if idxs:
-                                        best_j = max(idxs, key=lambda j: conf[j])
+                                for target_id in (1, 2):
+                                    idxs_id = [j for j, tid in enumerate(tids) if tid == target_id]
+                                    if idxs_id:
+                                        best_j = max(idxs_id, key=lambda j: conf[j])
                                         x1_, y1_, x2_, y2_ = xyxy[best_j]
-                                        store_array[idx] = f"{int(x1_)},{int(y1_)},{int(x2_)},{int(y2_)}"
+                                        x1_i, y1_i, x2_i, y2_i = int(x1_), int(y1_), int(x2_), int(y2_)
+                                        if target_id == 1:
+                                            batch_box_fencerID1[idx] = f"{x1_i},{y1_i},{x2_i},{y2_i}"
+                                            batch_box_coords_id1[idx] = (x1_i, y1_i, x2_i, y2_i)
+                                        else:
+                                            batch_box_fencerID2[idx] = f"{x1_i},{y1_i},{x2_i},{y2_i}"
+                                            batch_box_coords_id2[idx] = (x1_i, y1_i, x2_i, y2_i)
 
                     # --- 3) Point detector on scoreboard crops (batched) ---
                     if use_point_detector:
@@ -512,7 +624,107 @@ def process_video_with_models(
                                         elif c == 1:
                                             batch_touch_right[idx_in_list] = 1
 
-                    # --- 4) Write frames + CSV rows ---
+                    # --- 4) Model_Two (skeleton) on expanded crops for ID1 and ID2 ---
+                    skeleton_crops = []
+                    skeleton_meta = []  # list of (frame_idx_in_batch, fencer_id, x_offset, y_offset)
+
+                    expand_factor = 0.15  # 15% expansion on each side in x
+
+                    for idx in range(n_batch):
+                        for fencer_id, box_coords in (
+                            (1, batch_box_coords_id1[idx]),
+                            (2, batch_box_coords_id2[idx]),
+                        ):
+                            if box_coords is None:
+                                continue
+                            x1_b, y1_b, x2_b, y2_b = box_coords
+                            w_box = x2_b - x1_b
+                            if w_box <= 0:
+                                continue
+                            expand = int(w_box * expand_factor)
+
+                            x1_exp = max(0, x1_b - expand)
+                            x2_exp = min(width - 1, x2_b + expand)
+                            y1_exp = y1_b
+                            y2_exp = y2_b
+
+                            if x2_exp <= x1_exp or y2_exp <= y1_exp:
+                                continue
+
+                            crop = frames[idx][y1_exp:y2_exp, x1_exp:x2_exp]
+                            if crop.size == 0:
+                                continue
+
+                            skeleton_crops.append(crop)
+                            # offset to map keypoints back to full frame coords
+                            skeleton_meta.append((idx, fencer_id, x1_exp, y1_exp))
+
+                    if skeleton_crops:
+                        results_two = model_two(
+                            skeleton_crops,
+                            device=device,
+                            verbose=False,
+                            conf=0.5,
+                            imgsz=448,
+                        )
+
+                        for meta, res_pose in zip(skeleton_meta, results_two):
+                            frame_idx_in_batch, fencer_id, x_off, y_off = meta
+                            frame = frames[frame_idx_in_batch]
+
+                            kps = getattr(res_pose, "keypoints", None)
+                            if kps is None or kps.xy is None:
+                                continue
+
+                            kps_xy = kps.xy  # tensor [num_person, num_kpts, 2]
+                            kps_conf = kps.conf  # tensor [num_person, num_kpts]
+
+                            if kps_xy is None or kps_xy.numel() == 0:
+                                continue
+
+                            # Choose the first person (or main detection)
+                            # You could also choose the one with highest mean keypoint conf.
+                            if kps_conf is not None and kps_conf.numel() > 0:
+                                # Select person index with highest mean conf
+                                mean_conf = kps_conf.mean(dim=1)  # [num_person]
+                                person_idx = int(torch.argmax(mean_conf).item())
+                                k_xy = kps_xy[person_idx].cpu().numpy()
+                                k_conf = kps_conf[person_idx].cpu().numpy()
+                            else:
+                                k_xy = kps_xy[0].cpu().numpy()
+                                k_conf = None
+
+                            # Map keypoints back to full-frame coordinates
+                            full_xy = []
+                            for (x_c, y_c) in k_xy:
+                                full_xy.append((float(x_c) + x_off, float(y_c) + y_off))
+
+                            # Draw skeleton (different color for ID1 vs ID2)
+                            if fencer_id == 1:
+                                skel_color = (0, 0, 255)  # red
+                            else:
+                                skel_color = (255, 255, 0)  # cyan
+
+                            draw_skeleton_on_frame(
+                                frame,
+                                full_xy,
+                                keypoints_conf=k_conf,
+                                edges=skeleton_edges,
+                                color=skel_color,
+                                conf_th=0.3,
+                            )
+
+                            # Save skeleton coords in CSV string "x0,y0;...;x12,y12"
+                            coords_str = ";".join(
+                                f"{int(x)},{int(y)}" for (x, y) in full_xy
+                            )
+
+                            if fencer_id == 1:
+                                batch_skeleton_id1[frame_idx_in_batch] = coords_str
+                            else:
+                                batch_skeleton_id2[frame_idx_in_batch] = coords_str
+
+                    # --- 5) Write frames + CSV rows ---
                     for i, frame in enumerate(frames):
                         frame_number = frame_index + i
                         time_sec = frame_number / fps if fps > 0 else 0.0
@@ -525,6 +737,8 @@ def process_video_with_models(
                             batch_touch_right[i],
                             batch_box_fencerID1[i],
                             batch_box_fencerID2[i],
+                            batch_skeleton_id1[i],
+                            batch_skeleton_id2[i],
                         ])
 
                     processed_frames += n_batch
@@ -539,7 +753,7 @@ def process_video_with_models(
     elapsed_time = time.time() - start_time
 
     print(f"\nDone! Combined annotated video saved at:\n{output_video_path}")
-    print(f"CSV with touches saved at:\n{csv_path}\n")
+    print(f"CSV with touches + boxes + skeletons saved at:\n{csv_path}\n")
 
     return processed_frames, elapsed_time
 
@@ -556,6 +770,7 @@ def main():
             model_one_path,
             model_pointdetector_path,
             model_scoreboard_path,
+            model_two_path,
             output_dir,
         ) = get_project_paths()
 
@@ -564,6 +779,7 @@ def main():
         check_file_exists(model_one_path, "Model_One")
         check_file_exists(model_scoreboard_path, "Model_Scoreboard_fp16")
         check_file_exists(model_pointdetector_path, "Model_PointDetector21_fp16")
+        check_file_exists(model_two_path, "Model_Two_fp16")
 
         device = get_device()
 
@@ -571,6 +787,7 @@ def main():
         model_one = load_yolo_model(model_one_path, device)
         model_scoreboard = load_yolo_model(model_scoreboard_path, device)
         model_pointdetector = load_yolo_model(model_pointdetector_path, device)
+        model_two = load_yolo_model(model_two_path, device)
 
         # Output video path
         output_video_path = output_dir / OUTPUT_VIDEO_NAME
@@ -581,6 +798,7 @@ def main():
             model_one=model_one,
             model_scoreboard=model_scoreboard,
             model_pointdetector=model_pointdetector,
+            model_two=model_two,
             output_video_path=output_video_path,
             device=device,
             batch_size=BATCH_SIZE,
