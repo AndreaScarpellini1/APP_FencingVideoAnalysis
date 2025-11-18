@@ -12,9 +12,11 @@ from ultralytics import YOLO
 # Configuration
 # =========================
 
-VIDEO_FILENAME = "100vs100_HMN1_MT15_TN23_CR15-12.MP4"
+#VIDEO_FILENAME = "100vs100_HMN1_MT15_TN23_CR15-12.MP4"
+VIDEO_FILENAME ="12vs5_HMN1_MT15_TN5_CR5-1.MP4"
 MODEL_ONE_NAME = "Model_One_fp16.pt"
-MODEL_THREE_NAME = "Model_Three_fp16.pt"
+MODEL_SCOREBOARD = "Model_Scoreboard_fp16.pt"
+MODEL_POINT_DETECTOR = "Model_PointDetector21_fp16.pt"
 OUTPUT_VIDEO_NAME = "annotated_combined.mp4"
 BATCH_SIZE = 32  # you can tweak this if needed
 
@@ -222,7 +224,7 @@ def process_video_with_two_models(
                 break
 
             # YOLO accepts list of np.ndarray as batched input
-            results_one = model_one(frames, device=device, verbose=False)
+            results_one = model_one(frames, device=device, verbose=False, imgsz = 512)
             results_three = model_three(frames, device=device, verbose=False)
 
             # Annotate frames in-place
