@@ -52,7 +52,8 @@ def main():
     model_files = [
         models_dir / "Model_One.pt",
         models_dir / "Model_Two.pt",
-        models_dir / "Model_Three.pt"
+        models_dir / "Model_Scoreboard.pt",
+        models_dir / "Model_PointDetector21.pt",
     ]
 
     for mp in model_files:
