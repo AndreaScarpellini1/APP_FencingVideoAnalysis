@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import csv  # for CSV writing
+from dataclasses import dataclass  # NEW: for logical ID state
 
 import cv2
 import torch
@@ -13,13 +14,15 @@ from ultralytics import YOLO
 # Configuration
 # =========================
 
-VIDEO_FILENAME = "100vs100_HMN1_MT15_TN23_CR15-12.MP4"
+VIDEO_FILENAME = "GX010582 (1).MP4"
+# VIDEO_FILENAME = "100vs100_HMN1_MT15_TN23_CR15-12.MP4"
 # VIDEO_FILENAME = "12vs5_HMN1_MT15_TN5_CR5-1.MP4"
+# VIDEO_FILENAME = "Il mio filmato.mp4"
 
 MODEL_ONE_NAME = "Model_One_fp16.pt"
 MODEL_SCOREBOARD = "Model_Scoreboard_fp16.pt"
 MODEL_POINT_DETECTOR = "Model_PointDetector21_fp16.pt"
-MODEL_TWO_NAME = "Model_Two_fp16.pt"   # <--- NEW: pose / skeleton model
+MODEL_TWO_NAME = "Model_Two_fp16.pt"   # pose / skeleton model
 
 OUTPUT_VIDEO_NAME = "annotated_combined.mp4"
 
@@ -157,7 +160,6 @@ def get_video_properties(cap: cv2.VideoCapture) -> Tuple[float, int, int, int]:
     print(f"Video properties -> FPS: {fps}, Size: {width}x{height}, Frames: {total_frames}")
     return fps, width, height, total_frames
 
-
 def create_video_writer(output_path: Path, fps: float, width: int, height: int) -> cv2.VideoWriter:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -197,7 +199,7 @@ def draw_detections_on_frame(
     """
     Draw bounding boxes and labels from a single YOLO Result on the given frame.
     If tracking IDs are present (from ByteTrack), they are appended to the label.
-    Optionally color specific IDs using id_color_map (e.g. {1: (0,0,255), 2: (255,255,0)}).
+    Optionally color specific IDs using id_color_map (e.g. {tid: (B,G,R)}).
     """
     boxes = result.boxes
     if boxes is None or boxes.xyxy is None:
@@ -217,6 +219,7 @@ def draw_detections_on_frame(
     for (x1, y1, x2, y2), c, p, tid in zip(xyxy, cls, conf, ids):
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
         base_label = f"{label_prefix}{names[c]} {p:.2f}"
+        # For debugging it’s useful to see the real ByteTrack ID
         if tid is not None:
             label = f"{base_label} ID{tid}"
         else:
@@ -331,6 +334,119 @@ def draw_skeleton_on_frame(
 
 
 # =========================
+# Logical ID remapping (stable left/right over time)
+# =========================
+
+@dataclass
+class LogicalIDState:
+    """
+    Maintains a mapping from ByteTrack IDs to logical fencers:
+
+    - current_left_tid:  ByteTrack ID currently representing logical ID1 (left fencer)
+    - current_right_tid: ByteTrack ID currently representing logical ID2 (right fencer)
+
+    When the tracker starts using different IDs consistently for `min_streak`
+    frames, we remap them.
+    """
+    current_left_tid: Optional[int] = None
+    current_right_tid: Optional[int] = None
+
+    stable_pair_ids: Optional[Tuple[int, int]] = None
+    stable_pair_len: int = 0
+    min_streak: int = 12  # frames required to accept new mapping
+
+
+def pick_left_right_from_ids(
+    tids: List[int],
+    centers: Dict[int, Tuple[float, float]],
+) -> Tuple[int, int]:
+    """
+    Given exactly two tids and their centers, return (left_tid, right_tid)
+    based on center x coordinate.
+    """
+    assert len(tids) == 2
+    t1, t2 = tids
+    cx1, _ = centers[t1]
+    cx2, _ = centers[t2]
+    if cx1 <= cx2:
+        return t1, t2
+    else:
+        return t2, t1
+
+
+def update_logical_ids_for_frame(
+    state: LogicalIDState,
+    tids_in_frame: List[int],
+    centers: Dict[int, Tuple[float, float]],
+) -> None:
+    """
+    Update logical left/right mapping for this frame.
+
+    Args:
+        state: logical ID state (modified in-place)
+        tids_in_frame: list of ByteTrack IDs present (e.g. [1,2] or [6,8])
+        centers: dict tid -> (cx, cy)
+    """
+
+    # Unique & sorted for consistency
+    tids_unique = sorted(set(tids_in_frame))
+
+    # No detections -> reset candidate stable pair, keep old mapping
+    if not tids_unique:
+        state.stable_pair_ids = None
+        state.stable_pair_len = 0
+        return
+
+    # If we don't have an initial mapping yet and 2 tids are present, use them.
+    if state.current_left_tid is None or state.current_right_tid is None:
+        if len(tids_unique) >= 2:
+            pair = tids_unique[:2]
+            left_tid, right_tid = pick_left_right_from_ids(pair, centers)
+            state.current_left_tid = left_tid
+            state.current_right_tid = right_tid
+            state.stable_pair_ids = None
+            state.stable_pair_len = 0
+        return
+
+    # Already have a mapping: check if both mapped tids are present
+    if (
+        state.current_left_tid in tids_unique
+        and state.current_right_tid in tids_unique
+    ):
+        # mapping is still valid, reset stable_pair tracking
+        state.stable_pair_ids = None
+        state.stable_pair_len = 0
+        return
+
+    # Mapping broken: at least one of the mapped tids is missing.
+    # We look for a new stable pair over multiple frames.
+
+    # Need exactly 2 tids to form a candidate pair (you can relax this if needed).
+    if len(tids_unique) != 2:
+        # can't form a stable pair yet
+        state.stable_pair_ids = None
+        state.stable_pair_len = 0
+        return
+
+    candidate_pair = tuple(tids_unique)  # sorted
+
+    if state.stable_pair_ids == candidate_pair:
+        state.stable_pair_len += 1
+    else:
+        state.stable_pair_ids = candidate_pair
+        state.stable_pair_len = 1
+
+    # If this pair has been stable long enough, accept it as the new mapping.
+    if state.stable_pair_len >= state.min_streak:
+        left_tid, right_tid = pick_left_right_from_ids(list(candidate_pair), centers)
+        state.current_left_tid = left_tid
+        state.current_right_tid = right_tid
+        # reset candidate state
+        state.stable_pair_ids = None
+        state.stable_pair_len = 0
+
+
+# =========================
 # Scoreboard detection (first frame)
 # =========================
 
@@ -367,7 +483,7 @@ def detect_scoreboard_box(model_scoreboard: YOLO, frame, device: str):
 
 
 # =========================
-# Core processing logic (with ByteTrack for fencers, batched)
+# Core processing logic (with ByteTrack + logical IDs, batched)
 # =========================
 
 def process_video_with_models(
@@ -384,12 +500,16 @@ def process_video_with_models(
     Batched processing + ByteTrack tracking for fencers (model_one).
 
     - model_one: uses .track(...) with tracker="bytetrack.yaml" and persist=True
-                 on batched frames (list of np.ndarray) to track all fencers.
-      * We specially track ID1 and ID2 for skeleton.
+                 on batched frames (list of np.ndarray).
+      We use a logical ID state so:
+        * logical ID1 is always the left fencer,
+        * logical ID2 is always the right fencer,
+        * if ByteTrack changes the raw IDs but a new pair of tids is stable
+          for >= min_streak frames, we remap them.
     - model_scoreboard: used on first frame only to find scoreboard bbox.
     - model_pointdetector: runs on cropped scoreboard area (batched crops).
     - model_two: pose/skeleton model, runs ONLY on expanded crops
-                 of fencer ID1 and ID2.
+                 of logical fencer 1 and 2.
 
     CSV: one row per frame with:
         Frame_Number, Time, TouchLeft, TouchRight,
@@ -397,18 +517,12 @@ def process_video_with_models(
         SkeletonID1, SkeletonID2
 
     Box_FencerID1 / Box_FencerID2:
-      - bbox of track ID 1/2 in the format "x1,y1,x2,y2"
-      - "NaN" if that ID is not detected in that frame.
+      - bbox of logical fencer 1/2 in the format "x1,y1,x2,y2"
+      - "NaN" if not detected in that frame.
 
     SkeletonID1 / SkeletonID2:
-      - skeleton keypoints in the format "x0,y0;x1,y1;...;x12,y12"
-      - "NaN" if skeleton not detected for that ID in that frame.
-
-    Thresholds:
-      - model_one (tracking, fencers): conf = 0.8
-      - model_scoreboard: conf = 0.5
-      - model_pointdetector: conf = 0.5 and p >= 0.5 in Python filter
-      - model_two (pose): conf = 0.5 for detections, keypoints conf >= 0.3 for drawing
+      - skeleton keypoints in the format "x0,y0;...;x12,y12"
+      - "NaN" if skeleton not detected for that logical fencer in that frame.
     """
     cap = open_video_capture(video_path)
     fps, width, height, total_frames = get_video_properties(cap)
@@ -452,11 +566,8 @@ def process_video_with_models(
     frame_index = 0  # global frame counter used for CSV Frame_Number
     start_time = time.time()
 
-    # Color map for tracked IDs: ID 1 and ID 2 special
-    id_color_map = {
-        1: (0, 0, 255),      # ID 1 -> red (BGR)
-        2: (255, 255, 0),    # ID 2 -> cyan (BGR)
-    }
+    # Logical ID state: maintains mapping left/right over time
+    logical_state = LogicalIDState(min_streak=12)
 
     with open(csv_path, "w", newline="") as csvfile:
         csv_writer = csv.writer(csvfile)
@@ -500,22 +611,50 @@ def process_video_with_models(
                         persist=True,   # keep ByteTrack state across calls
                         conf=0.8,
                         imgsz=448,
+                        max_det=2,      # at most 2 detections per frame
                     )
 
-                    # Draw fencers + optionally scoreboard, and at the same time
-                    # extract boxes for track IDs 1 and 2.
-                    if use_point_detector:
-                        for idx, (frame, r1) in enumerate(zip(frames, results_one)):
-                            # draw fencers (ID1/ID2 with special colors)
-                            draw_detections_on_frame(
-                                frame,
-                                r1,
-                                color=(0, 255, 0),  # default green
-                                label_prefix="M1:",
-                                id_color_map=id_color_map,
-                            )
+                    # Process each frame: update logical IDs and draw fencers/scoreboard
+                    for idx, (frame, r1) in enumerate(zip(frames, results_one)):
+                        boxes = r1.boxes
+                        tids_in_frame: List[int] = []
+                        centers: Dict[int, Tuple[float, float]] = {}
 
-                            # draw scoreboard
+                        if boxes is not None and boxes.xyxy is not None and boxes.id is not None:
+                            xyxy = boxes.xyxy.cpu().numpy()
+                            tids = boxes.id.cpu().numpy().astype(int)
+
+                            for (x1_b, y1_b, x2_b, y2_b), tid in zip(xyxy, tids):
+                                cx = 0.5 * (x1_b + x2_b)
+                                cy = 0.5 * (y1_b + y2_b)
+                                tids_in_frame.append(tid)
+                                centers[tid] = (cx, cy)
+
+                        # --- Update logical left/right mapping for this frame ---
+                        update_logical_ids_for_frame(logical_state, tids_in_frame, centers)
+
+                        left_tid = logical_state.current_left_tid    # logical ID1
+                        right_tid = logical_state.current_right_tid  # logical ID2
+
+                        # Build a color map for this frame:
+                        # left fencer (logical 1) -> red, right fencer (logical 2) -> cyan
+                        id_color_map_frame: Dict[int, Tuple[int, int, int]] = {}
+                        if left_tid is not None:
+                            id_color_map_frame[left_tid] = (0, 0, 255)       # red
+                        if right_tid is not None:
+                            id_color_map_frame[right_tid] = (255, 255, 0)    # cyan
+
+                        # Draw fencers with per-frame color map
+                        draw_detections_on_frame(
+                            frame,
+                            r1,
+                            color=(0, 255, 0),  # default green for other IDs
+                            label_prefix="M1:",
+                            id_color_map=id_color_map_frame,
+                        )
+
+                        # Draw scoreboard if available
+                        if use_point_detector:
                             cv2.rectangle(frame, (x1_clip, y1_clip), (x2_clip, y2_clip), (255, 255, 0), 2)
                             cv2.putText(
                                 frame,
@@ -528,54 +667,34 @@ def process_video_with_models(
                                 cv2.LINE_AA,
                             )
 
-                            # --- extract bbox for track IDs 1 and 2 ---
-                            boxes = r1.boxes
-                            if boxes is not None and boxes.xyxy is not None and boxes.id is not None:
-                                xyxy = boxes.xyxy.cpu().numpy()
-                                conf = boxes.conf.cpu().numpy()
-                                tids = boxes.id.cpu().numpy().astype(int)
+                        # --- Extract bbox for logical fencer 1 (left) and 2 (right) ---
+                        if boxes is not None and boxes.xyxy is not None and boxes.id is not None:
+                            xyxy = boxes.xyxy.cpu().numpy()
+                            conf = boxes.conf.cpu().numpy()
+                            tids = boxes.id.cpu().numpy().astype(int)
 
-                                for target_id in (1, 2):
-                                    idxs_id = [j for j, tid in enumerate(tids) if tid == target_id]
-                                    if idxs_id:
-                                        best_j = max(idxs_id, key=lambda j: conf[j])
-                                        x1_, y1_, x2_, y2_ = xyxy[best_j]
-                                        x1_i, y1_i, x2_i, y2_i = int(x1_), int(y1_), int(x2_), int(y2_)
-                                        if target_id == 1:
-                                            batch_box_fencerID1[idx] = f"{x1_i},{y1_i},{x2_i},{y2_i}"
-                                            batch_box_coords_id1[idx] = (x1_i, y1_i, x2_i, y2_i)
-                                        else:
-                                            batch_box_fencerID2[idx] = f"{x1_i},{y1_i},{x2_i},{y2_i}"
-                                            batch_box_coords_id2[idx] = (x1_i, y1_i, x2_i, y2_i)
-                    else:
-                        for idx, (frame, r1) in enumerate(zip(frames, results_one)):
-                            draw_detections_on_frame(
-                                frame,
-                                r1,
-                                color=(0, 255, 0),
-                                label_prefix="M1:",
-                                id_color_map=id_color_map,
-                            )
+                            # helper to pick best box for a given tid
+                            def pick_best_box_for_tid(target_tid: int):
+                                idxs = [j for j, tid_val in enumerate(tids) if tid_val == target_tid]
+                                if not idxs:
+                                    return None
+                                best_j = max(idxs, key=lambda j: conf[j])
+                                x1_, y1_, x2_, y2_ = xyxy[best_j]
+                                return int(x1_), int(y1_), int(x2_), int(y2_)
 
-                            # --- extract bbox for track IDs 1 and 2 ---
-                            boxes = r1.boxes
-                            if boxes is not None and boxes.xyxy is not None and boxes.id is not None:
-                                xyxy = boxes.xyxy.cpu().numpy()
-                                conf = boxes.conf.cpu().numpy()
-                                tids = boxes.id.cpu().numpy().astype(int)
+                            if left_tid is not None:
+                                box1 = pick_best_box_for_tid(left_tid)
+                                if box1 is not None:
+                                    x1_i, y1_i, x2_i, y2_i = box1
+                                    batch_box_fencerID1[idx] = f"{x1_i},{y1_i},{x2_i},{y2_i}"
+                                    batch_box_coords_id1[idx] = (x1_i, y1_i, x2_i, y2_i)
 
-                                for target_id in (1, 2):
-                                    idxs_id = [j for j, tid in enumerate(tids) if tid == target_id]
-                                    if idxs_id:
-                                        best_j = max(idxs_id, key=lambda j: conf[j])
-                                        x1_, y1_, x2_, y2_ = xyxy[best_j]
-                                        x1_i, y1_i, x2_i, y2_i = int(x1_), int(y1_), int(x2_), int(y2_)
-                                        if target_id == 1:
-                                            batch_box_fencerID1[idx] = f"{x1_i},{y1_i},{x2_i},{y2_i}"
-                                            batch_box_coords_id1[idx] = (x1_i, y1_i, x2_i, y2_i)
-                                        else:
-                                            batch_box_fencerID2[idx] = f"{x1_i},{y1_i},{x2_i},{y2_i}"
-                                            batch_box_coords_id2[idx] = (x1_i, y1_i, x2_i, y2_i)
+                            if right_tid is not None:
+                                box2 = pick_best_box_for_tid(right_tid)
+                                if box2 is not None:
+                                    x1_i, y1_i, x2_i, y2_i = box2
+                                    batch_box_fencerID2[idx] = f"{x1_i},{y1_i},{x2_i},{y2_i}"
+                                    batch_box_coords_id2[idx] = (x1_i, y1_i, x2_i, y2_i)
 
                     # --- 3) Point detector on scoreboard crops (batched) ---
                     if use_point_detector:
@@ -612,11 +731,11 @@ def process_video_with_models(
                                 )
 
                                 # Touch logic using class index: 0 = TouchLeft, 1 = TouchRIght
-                                boxes = crop_result.boxes
-                                if boxes is not None and boxes.xyxy is not None and len(boxes.xyxy) > 0:
-                                    cls = boxes.cls.cpu().numpy().astype(int)
-                                    conf = boxes.conf.cpu().numpy()
-                                    for c, p in zip(cls, conf):
+                                boxes_p = crop_result.boxes
+                                if boxes_p is not None and boxes_p.xyxy is not None and len(boxes_p.xyxy) > 0:
+                                    cls_p = boxes_p.cls.cpu().numpy().astype(int)
+                                    conf_p = boxes_p.conf.cpu().numpy()
+                                    for c, p in zip(cls_p, conf_p):
                                         if p < 0.5:
                                             continue
                                         if c == 0:
@@ -624,7 +743,7 @@ def process_video_with_models(
                                         elif c == 1:
                                             batch_touch_right[idx_in_list] = 1
 
-                    # --- 4) Model_Two (skeleton) on expanded crops for ID1 and ID2 ---
+                    # --- 4) Model_Two (skeleton) on expanded crops for logical fencer 1 and 2 ---
                     skeleton_crops = []
                     skeleton_meta = []  # list of (frame_idx_in_batch, fencer_id, x_offset, y_offset)
 
@@ -682,10 +801,8 @@ def process_video_with_models(
                             if kps_xy is None or kps_xy.numel() == 0:
                                 continue
 
-                            # Choose the first person (or main detection)
-                            # You could also choose the one with highest mean keypoint conf.
+                            # Choose the person with highest mean keypoint conf
                             if kps_conf is not None and kps_conf.numel() > 0:
-                                # Select person index with highest mean conf
                                 mean_conf = kps_conf.mean(dim=1)  # [num_person]
                                 person_idx = int(torch.argmax(mean_conf).item())
                                 k_xy = kps_xy[person_idx].cpu().numpy()
@@ -699,7 +816,7 @@ def process_video_with_models(
                             for (x_c, y_c) in k_xy:
                                 full_xy.append((float(x_c) + x_off, float(y_c) + y_off))
 
-                            # Draw skeleton (different color for ID1 vs ID2)
+                            # Draw skeleton (different color for logical ID1 vs ID2)
                             if fencer_id == 1:
                                 skel_color = (0, 0, 255)  # red
                             else:
@@ -714,7 +831,7 @@ def process_video_with_models(
                                 conf_th=0.3,
                             )
 
-                            # Save skeleton coords in CSV string "x0,y0;...;x12,y12"
+                            # Save skeleton coords in CSV string "x0,y0;...;xN,yN"
                             coords_str = ";".join(
                                 f"{int(x)},{int(y)}" for (x, y) in full_xy
                             )
