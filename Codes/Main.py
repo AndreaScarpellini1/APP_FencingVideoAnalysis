@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import csv  # for CSV writing
-from dataclasses import dataclass  # for logical ID state
+from dataclasses import dataclass  # NEW: for logical ID state
 
 import cv2
 import torch
@@ -13,16 +13,16 @@ from ultralytics import YOLO
 # =========================
 # Configuration
 # =========================
-VIDEO_FILENAME = "GX010583.MP4"
-# VIDEO_FILENAME = "GX010582 (1).MP4"
+
+VIDEO_FILENAME = "GX010600.MP4"
 # VIDEO_FILENAME = "100vs100_HMN1_MT15_TN23_CR15-12.MP4"
 # VIDEO_FILENAME = "12vs5_HMN1_MT15_TN5_CR5-1.MP4"
 # VIDEO_FILENAME = "Il mio filmato.mp4"
 
-MODEL_ONE_NAME = "Model_One_fp16.pt"          # detector: classe 0 = pista, altre = schermidori
+MODEL_ONE_NAME = "Model_One_fp16.pt"
 MODEL_SCOREBOARD = "Model_Scoreboard_fp16.pt"
 MODEL_POINT_DETECTOR = "Model_PointDetector21_fp16.pt"
-MODEL_TWO_NAME = "Model_Two_fp16.pt"          # pose / skeleton model
+MODEL_TWO_NAME = "Model_Two_fp16.pt"   # pose / skeleton model
 
 OUTPUT_VIDEO_NAME = "annotated_combined.mp4"
 
@@ -31,14 +31,6 @@ TRACKER_CONFIG = "bytetrack.yaml"
 
 # Batch size for batched frame processing
 BATCH_SIZE = 32
-
-# -------------------------
-# Piste configuration
-# -------------------------
-# La pista viene letta dalla classe 0 del Model_One.
-# Qui definiamo solo di quanto espandere il bounding box della pista
-# (sia in X che in Y) per decidere se un fencer è "sulla pista".
-PISTE_MARGIN_FACTOR = 0.02  # 10% di espansione intorno al box pista
 
 # Custom skeleton edges (using your indices)
 skeleton_edges = [
@@ -168,7 +160,6 @@ def get_video_properties(cap: cv2.VideoCapture) -> Tuple[float, int, int, int]:
     print(f"Video properties -> FPS: {fps}, Size: {width}x{height}, Frames: {total_frames}")
     return fps, width, height, total_frames
 
-
 def create_video_writer(output_path: Path, fps: float, width: int, height: int) -> cv2.VideoWriter:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -195,129 +186,40 @@ def read_frame_batch(cap: cv2.VideoCapture, batch_size: int) -> List:
 
 
 # =========================
-# Piste & fencer selection helpers
-# =========================
-
-def select_fencer_indices(
-    xyxy,
-    conf,
-    cls,
-    piste_box: Optional[Tuple[int, int, int, int]],
-    piste_margin_factor: float = 0.10,
-    max_fencers: int = 2,
-) -> List[int]:
-    """
-    Select up to max_fencers detections that are fencers (cls != 0),
-    using the piste box (class 0) as reference.
-
-    - If piste_box is None -> just pick best max_fencers by confidence among cls != 0.
-    - Otherwise:
-        1. Enlarge piste_box by piste_margin_factor in both x and y.
-        2. A detection is "inside piste" if:
-             - it's not class 0
-             - its bottom y is inside [piste_y1_exp, piste_y2_exp]
-             - its center x is inside [piste_x1_exp, piste_x2_exp]
-        3. If >= 2 inside -> take 2 most confident inside.
-           If exactly 1 inside -> that + best outside.
-           If 0 inside -> best over full frame (among fencers).
-    """
-    num_det = len(xyxy)
-    if num_det == 0:
-        return []
-
-    # valid fencer detections (cls != 0)
-    fencer_indices = [j for j in range(num_det) if cls[j] != 0]
-    if not fencer_indices:
-        return []
-
-    def sort_by_conf(idxs):
-        return sorted(idxs, key=lambda idx: conf[idx], reverse=True)
-
-    # No piste detected yet -> just use best fencer detections globally
-    if piste_box is None:
-        return sort_by_conf(fencer_indices)[:max_fencers]
-
-    x1_p, y1_p, x2_p, y2_p = piste_box
-    w_p = max(1, x2_p - x1_p)
-    h_p = max(1, y2_p - y1_p)
-
-    # Enlarge piste box
-    dx = int(w_p * piste_margin_factor)
-    dy = int(h_p * piste_margin_factor)
-
-    x1_exp = x1_p - dx
-    x2_exp = x2_p + dx
-    y1_exp = y1_p - dy
-    y2_exp = y2_p + dy
-
-    inside: List[int] = []
-    outside: List[int] = []
-
-    for j in fencer_indices:
-        x1, y1, x2, y2 = xyxy[j]
-        y_bottom = y2
-        cx = 0.5 * (x1 + x2)
-
-        if (x1_exp <= cx <= x2_exp) and (y1_exp <= y_bottom <= y2_exp):
-            inside.append(j)
-        else:
-            outside.append(j)
-
-    inside = sort_by_conf(inside)
-    outside = sort_by_conf(outside)
-
-    if len(inside) >= max_fencers:
-        return inside[:max_fencers]
-    elif len(inside) == 1:
-        selected = [inside[0]]
-        if outside:
-            selected.append(outside[0])
-        return selected
-    else:
-        # 0 inside piste -> best fencers globally
-        all_fencers_sorted = sort_by_conf(fencer_indices)
-        return all_fencers_sorted[:max_fencers]
-
-
-# =========================
 # Drawing & annotation
 # =========================
 
-def draw_selected_detections(
+def draw_detections_on_frame(
     frame,
-    boxes,
-    indices: List[int],
+    result,
     color: Tuple[int, int, int],
     label_prefix: str = "",
     id_color_map: Optional[Dict[int, Tuple[int, int, int]]] = None,
 ):
     """
-    Draw ONLY detections whose index is in `indices`.
-    Used so we don't display extra fencers beyond the chosen 2.
+    Draw bounding boxes and labels from a single YOLO Result on the given frame.
+    If tracking IDs are present (from ByteTrack), they are appended to the label.
+    Optionally color specific IDs using id_color_map (e.g. {tid: (B,G,R)}).
     """
-    if boxes is None or boxes.xyxy is None or len(indices) == 0:
+    boxes = result.boxes
+    if boxes is None or boxes.xyxy is None:
         return
 
-    xyxy_all = boxes.xyxy.cpu().numpy()
-    cls_all = boxes.cls.cpu().numpy().astype(int)
-    conf_all = boxes.conf.cpu().numpy()
+    xyxy = boxes.xyxy.cpu().numpy()
+    cls = boxes.cls.cpu().numpy().astype(int)
+    conf = boxes.conf.cpu().numpy()
+    names = result.names
 
     # IDs for tracking (may be None if no tracking)
     if hasattr(boxes, "id") and boxes.id is not None:
-        ids_all = boxes.id.cpu().numpy().astype(int)
+        ids = boxes.id.cpu().numpy().astype(int)
     else:
-        ids_all = [None] * len(xyxy_all)
+        ids = [None] * len(xyxy)
 
-    for j in indices:
-        x1, y1, x2, y2 = xyxy_all[j]
-        c = cls_all[j]
-        p = conf_all[j]
-        tid = ids_all[j] if j < len(ids_all) else None
-
+    for (x1, y1, x2, y2), c, p, tid in zip(xyxy, cls, conf, ids):
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-        # we print class index as c (you can map to names if you prefer)
-        base_label = f"{label_prefix}{c} {p:.2f}"
-
+        base_label = f"{label_prefix}{names[c]} {p:.2f}"
+        # For debugging it’s useful to see the real ByteTrack ID
         if tid is not None:
             label = f"{base_label} ID{tid}"
         else:
@@ -440,8 +342,8 @@ class LogicalIDState:
     """
     Maintains a mapping from ByteTrack IDs to logical fencers:
 
-    - current_left_tid:  ByteTrack ID currently representing logical ID1 (left fencer / person1)
-    - current_right_tid: ByteTrack ID currently representing logical ID2 (right fencer / person2)
+    - current_left_tid:  ByteTrack ID currently representing logical ID1 (left fencer)
+    - current_right_tid: ByteTrack ID currently representing logical ID2 (right fencer)
 
     When the tracker starts using different IDs consistently for `min_streak`
     frames, we remap them.
@@ -478,8 +380,12 @@ def update_logical_ids_for_frame(
     centers: Dict[int, Tuple[float, float]],
 ) -> None:
     """
-    Update logical left/right mapping for this frame, using only tids_in_frame
-    (i.e., already filtered fencers).
+    Update logical left/right mapping for this frame.
+
+    Args:
+        state: logical ID state (modified in-place)
+        tids_in_frame: list of ByteTrack IDs present (e.g. [1,2] or [6,8])
+        centers: dict tid -> (cx, cy)
     """
 
     # Unique & sorted for consistency
@@ -515,7 +421,7 @@ def update_logical_ids_for_frame(
     # Mapping broken: at least one of the mapped tids is missing.
     # We look for a new stable pair over multiple frames.
 
-    # Need exactly 2 tids to form a candidate pair
+    # Need exactly 2 tids to form a candidate pair (you can relax this if needed).
     if len(tids_unique) != 2:
         # can't form a stable pair yet
         state.stable_pair_ids = None
@@ -594,11 +500,12 @@ def process_video_with_models(
     Batched processing + ByteTrack tracking for fencers (model_one).
 
     - model_one: uses .track(...) with tracker="bytetrack.yaml" and persist=True
-                 on batched frames (list of np.ndarray), with NO max_det limit.
-      We then select up to 2 fencers per frame according to piste rules and
-      use only those for logical IDs and CSV/skeleton; extra detections are
-      NOT drawn.
-      class 0 of model_one = pista (used to build the piste box).
+                 on batched frames (list of np.ndarray).
+      We use a logical ID state so:
+        * logical ID1 is always the left fencer,
+        * logical ID2 is always the right fencer,
+        * if ByteTrack changes the raw IDs but a new pair of tids is stable
+          for >= min_streak frames, we remap them.
     - model_scoreboard: used on first frame only to find scoreboard bbox.
     - model_pointdetector: runs on cropped scoreboard area (batched crops).
     - model_two: pose/skeleton model, runs ONLY on expanded crops
@@ -608,6 +515,14 @@ def process_video_with_models(
         Frame_Number, Time, TouchLeft, TouchRight,
         Box_FencerID1, Box_FencerID2,
         SkeletonID1, SkeletonID2
+
+    Box_FencerID1 / Box_FencerID2:
+      - bbox of logical fencer 1/2 in the format "x1,y1,x2,y2"
+      - "NaN" if not detected in that frame.
+
+    SkeletonID1 / SkeletonID2:
+      - skeleton keypoints in the format "x0,y0;...;x12,y12"
+      - "NaN" if skeleton not detected for that logical fencer in that frame.
     """
     cap = open_video_capture(video_path)
     fps, width, height, total_frames = get_video_properties(cap)
@@ -654,9 +569,6 @@ def process_video_with_models(
     # Logical ID state: maintains mapping left/right over time
     logical_state = LogicalIDState(min_streak=12)
 
-    # Current piste box (updated from class 0 of model_one)
-    current_piste_box: Optional[Tuple[int, int, int, int]] = None
-
     with open(csv_path, "w", newline="") as csvfile:
         csv_writer = csv.writer(csvfile)
         csv_writer.writerow([
@@ -699,91 +611,49 @@ def process_video_with_models(
                         persist=True,   # keep ByteTrack state across calls
                         conf=0.8,
                         imgsz=448,
-                        # NO max_det here -> model can output many detections
+                        max_det=2,      # at most 2 detections per frame
                     )
 
-                    # Process each frame: detect piste (class 0), filter fencers by piste,
-                    # update logical IDs, draw only chosen 2, and collect boxes.
+                    # Process each frame: update logical IDs and draw fencers/scoreboard
                     for idx, (frame, r1) in enumerate(zip(frames, results_one)):
                         boxes = r1.boxes
                         tids_in_frame: List[int] = []
                         centers: Dict[int, Tuple[float, float]] = {}
-                        selected_indices: List[int] = []
 
-                        if boxes is not None and boxes.xyxy is not None:
+                        if boxes is not None and boxes.xyxy is not None and boxes.id is not None:
                             xyxy = boxes.xyxy.cpu().numpy()
-                            conf = boxes.conf.cpu().numpy()
-                            cls = boxes.cls.cpu().numpy().astype(int)
-                            tids = boxes.id.cpu().numpy().astype(int) if boxes.id is not None else None
+                            tids = boxes.id.cpu().numpy().astype(int)
 
-                            # --- 2.1) Estrai box pista dalla classe 0 (se presente in questo frame) ---
-                            piste_indices = [j for j, c in enumerate(cls) if c == 0]
-                            if piste_indices:
-                                best_p_idx = max(piste_indices, key=lambda j: conf[j])
-                                x1_p, y1_p, x2_p, y2_p = xyxy[best_p_idx]
-                                current_piste_box = (
-                                    int(x1_p),
-                                    int(y1_p),
-                                    int(x2_p),
-                                    int(y2_p),
-                                )
+                            for (x1_b, y1_b, x2_b, y2_b), tid in zip(xyxy, tids):
+                                cx = 0.5 * (x1_b + x2_b)
+                                cy = 0.5 * (y1_b + y2_b)
+                                tids_in_frame.append(tid)
+                                centers[tid] = (cx, cy)
 
-                            # --- 2.2) Seleziona fino a 2 schermidori (cls != 0) usando il box pista ---
-                            selected_indices = select_fencer_indices(
-                                xyxy,
-                                conf,
-                                cls,
-                                piste_box=current_piste_box,
-                                piste_margin_factor=PISTE_MARGIN_FACTOR,
-                                max_fencers=2,
-                            )
-
-                            # Usa solo i selected_indices per aggiornare gli ID logici
-                            if tids is not None:
-                                for j in selected_indices:
-                                    x1_b, y1_b, x2_b, y2_b = xyxy[j]
-                                    tid = tids[j]
-                                    cx = 0.5 * (x1_b + x2_b)
-                                    cy = 0.5 * (y1_b + y2_b)
-                                    tids_in_frame.append(tid)
-                                    centers[tid] = (cx, cy)
-
-                        # --- 2.3) Aggiorna mappatura logica left/right (ID1/ID2) ---
+                        # --- Update logical left/right mapping for this frame ---
                         update_logical_ids_for_frame(logical_state, tids_in_frame, centers)
 
-                        left_tid = logical_state.current_left_tid    # logical ID1 (sinistra)
-                        right_tid = logical_state.current_right_tid  # logical ID2 (destra)
+                        left_tid = logical_state.current_left_tid    # logical ID1
+                        right_tid = logical_state.current_right_tid  # logical ID2
 
-                        # Colori: ID1 (left) rosso, ID2 (right) ciano
+                        # Build a color map for this frame:
+                        # left fencer (logical 1) -> red, right fencer (logical 2) -> cyan
                         id_color_map_frame: Dict[int, Tuple[int, int, int]] = {}
                         if left_tid is not None:
                             id_color_map_frame[left_tid] = (0, 0, 255)       # red
                         if right_tid is not None:
                             id_color_map_frame[right_tid] = (255, 255, 0)    # cyan
 
-                        # --- 2.4) Disegna solo i selected_indices (massimo 2 schermidori) ---
-                        if boxes is not None:
-                            draw_selected_detections(
-                                frame,
-                                boxes,
-                                selected_indices,
-                                color=(0, 255, 0),  # default green
-                                label_prefix="M1:",
-                                id_color_map=id_color_map_frame,
-                            )
+                        # Draw fencers with per-frame color map
+                        draw_detections_on_frame(
+                            frame,
+                            r1,
+                            color=(0, 255, 0),  # default green for other IDs
+                            label_prefix="M1:",
+                            id_color_map=id_color_map_frame,
+                        )
 
-                        # --- 2.5) Disegna il box della pista (classe 0) se esistente ---
-                        if current_piste_box is not None:
-                            x1_p, y1_p, x2_p, y2_p = current_piste_box
-                            cv2.rectangle(
-                                frame,
-                                (x1_p, y1_p),
-                                (x2_p, y2_p),
-                                (255, 0, 255),  # magenta
-                                2,
-                            )
-
-                        # --- 2.6) Disegna scoreboard se disponibile ---
+                        # Draw scoreboard if available
                         if use_point_detector:
                             cv2.rectangle(frame, (x1_clip, y1_clip), (x2_clip, y2_clip), (255, 255, 0), 2)
                             cv2.putText(
@@ -797,19 +667,15 @@ def process_video_with_models(
                                 cv2.LINE_AA,
                             )
 
-                        # --- 2.7) Estrai box per schermidori logici 1 (left) e 2 (right) ---
+                        # --- Extract bbox for logical fencer 1 (left) and 2 (right) ---
                         if boxes is not None and boxes.xyxy is not None and boxes.id is not None:
                             xyxy = boxes.xyxy.cpu().numpy()
                             conf = boxes.conf.cpu().numpy()
                             tids = boxes.id.cpu().numpy().astype(int)
 
-                            selected_set = set(selected_indices)
-
+                            # helper to pick best box for a given tid
                             def pick_best_box_for_tid(target_tid: int):
-                                idxs = [
-                                    j for j, tid_val in enumerate(tids)
-                                    if tid_val == target_tid and j in selected_set
-                                ]
+                                idxs = [j for j, tid_val in enumerate(tids) if tid_val == target_tid]
                                 if not idxs:
                                     return None
                                 best_j = max(idxs, key=lambda j: conf[j])
